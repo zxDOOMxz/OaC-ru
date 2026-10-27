@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Cyb and contributors. Developed by Cyb; thanks to Hatemost and CoA (Creation of Ashes).
+// GNU AGPL v3 with additional terms under section 7: see LICENSE and NOTICE.
+// ============================================================================
+//  spawns/generic_npc.cpp
+//
+//  See generic_npc.h.
+// ============================================================================
+#include "spawns/generic_npc.h"
+
+#include <algorithm>
+#include <bit>
+#include <cctype>
+#include <cstring>
+
+namespace aoc::worldd::spawns {
+
+using protocol::emit::FIntrepidNetworkGUID;
+
+namespace {
+
+std::string lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+uint64_t fnv1a(const std::string& s) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const unsigned char c : s) {
+        h ^= c;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+// C O A x Cyb
+
+uint64_t mix(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+/// A station Blueprint: under /Artisanship/, a CraftingStation_* or ProcessingStation_* class.
+bool is_station_path(const std::string& path) {
+    if (path.find("/Artisanship/") == std::string::npos) return false;
+    const std::string leaf = blueprint_leaf(path);
+    return leaf.rfind("CraftingStation_", 0) == 0 || leaf.rfind("ProcessingStation_", 0) == 0;
+}
+
+/// The block classes of a plain creature's open, in the order retail sends them.
+const char* const kPlain[] = {"ANPCCharacter", "UAlignmentComponent", "UNPCSecondaryInfo", "UNPCInfo", "UNPCCombatInfo", "UAoCAbilityComponent", "UAoCStatsComponent"};
+
+bool is_plain(const OpenTemplate& t) {
+    if (t.category != "npc" || t.blocks.size() != std::size(kPlain)) return false;
+    for (size_t i = 0; i < t.blocks.size(); ++i) {
+        if (t.blocks[i].cls != kPlain[i]) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+const char* verdict_name(Verdict v) {
+    switch (v) {
+        case Verdict::Generic: return "generic";
+        case Verdict::NotPawn: return "not a pawn";
+        case Verdict::Excluded: return "excluded";
+        case Verdict::Disabled: return "switched off";
+        case Verdict::NoTable: return "no npc_motion.tsv";
+        case Verdict::NoDonor: return "no donor open";
+        case Verdict::NoPath: return "no blueprint";
+    }
+    return "?";
+}
+
+std::string blueprint_leaf(const std::string& s) {
+    const size_t dot = s.rfind('.');
+    std::string leaf = s.substr(dot == std::string::npos ? (s.rfind('/') == std::string::npos ? 0 : s.rfind('/') + 1) : dot + 1);
+    if (leaf.rfind("Default__", 0) == 0) leaf = leaf.substr(9);
+    if (leaf.size() > 2 && leaf.compare(leaf.size() - 2, 2, "_C") == 0) leaf.resize(leaf.size() - 2);
+    return leaf;
+}
+
+uint64_t static_object_id(const std::string& path, const std::function<bool(uint64_t)>& taken) {
+    uint64_t salt = 0;
+    for (;;) {
+        const uint64_t id = (mix(fnv1a(path) ^ (salt * 0xD6E8FEB86659FD93ull)) | 1ull);
+        if (!taken || !taken(id)) return id;
+        ++salt;
+    }
+}
+
+GenericNpcs::GenericNpcs(const CapturedData& captured, const npc::MotionTable* blueprints, GenericConfig config)
+    : captured_(&captured), blueprints_(blueprints), config_(std::move(config)) {
+    for (const std::string& e : config_.exclude) {
+        if (!e.empty()) excluded_.insert(lower(e.find('/') == std::string::npos ? blueprint_leaf(e) : e));
+    }
+    // the plain donor: the Wolf's open when the captures have it, else the first plain creature in path order
+    const OpenTemplate* wolf = nullptr;
+    const OpenTemplate* first = nullptr;
+    for (const OpenTemplate& t : captured.opens()) {
+        if (!is_plain(t)) continue;
+        if (t.archetype_path.find("/Beast/Canine/Wolf.Default__Wolf_C") != std::string::npos) wolf = &t;
+        if (!first || t.archetype_path < first->archetype_path) first = &t;
+    }
+    donor_ = wolf ? wolf : first;
+    if (donor_) donor_path_ = donor_->archetype_path;
+    // the living huntable's eighth block: the Hunting_Raven's open, whose interactable the other kinds' differ from in two ids only
+    for (const OpenTemplate& t : captured.opens()) {
+        if (t.category != "npc" || t.archetype_path.find("/Hunting_Raven.Default__Hunting_Raven_C") == std::string::npos) continue;
+        const int i = t.find("UInteractableComponent");
+        if (i > 0 && t.blocks.size() == 8) {
+            hunt_block_ = &t.blocks[static_cast<size_t>(i)];
+            living_ = &t;
+        }
+    }
+}
+
+const OpenTemplate* GenericNpcs::template_for(const content::NpcAssetRow& asset, Verdict* why) const {
+    const auto fail = [&](Verdict v) -> const OpenTemplate* {
+        if (why) *why = v;
+        return nullptr;
+    };
+    if (why) *why = Verdict::Generic;
+    const std::string& path = asset.archetype_path;
+    if (path.empty()) return fail(Verdict::NoPath);
+    if (!config_.enabled) return fail(Verdict::Disabled);
+    if (is_station_path(path)) {
+        if (!excluded_.empty() && (excluded_.count(lower(blueprint_leaf(path))) || excluded_.count(lower(path)))) return fail(Verdict::Excluded);
+        return station_template(asset, why);
+    }
+    if (!blueprints_ || blueprints_->empty()) return fail(Verdict::NoTable);
+    if (!excluded_.empty() && (excluded_.count(lower(blueprint_leaf(path))) || excluded_.count(lower(path)))) return fail(Verdict::Excluded);
+    const OpenTemplate* plain = nullptr;
+    if (const auto it = made_.find(path); it != made_.end()) plain = &it->second;
+    if (!plain) plain = make_plain(asset, why);
+    if (!plain) return nullptr;
+    // a huntable creature: the plain template with the eighth block (the template is kept per interaction: two assets may share one Blueprint, HuntingTest and Hunting_Wolf do)
+    if (hunt_block_ && asset.interaction_def != 0 && asset.interact_component != 0 && config_.hunting_defs.count(asset.interaction_def)) {
+        const std::string key = path + "#hunting#" + std::to_string(asset.interact_component) + "#" + std::to_string(asset.interaction_def);
+        if (const auto it = made_.find(key); it != made_.end()) return &it->second;
+        OpenTemplate t = *plain;
+        // a living huntable's other blocks (the retail capture's Raven, to the bit in test_worldd_hunting): the CombatInfo's three flags written, the AbilityComponent empty, the nameplate's name
+        for (const char* cls : {"UNPCCombatInfo", "UAoCAbilityComponent"}) {
+            const int to = t.find(cls), from = living_ ? living_->find(cls) : -1;
+            if (to > 0 && from > 0) t.blocks[static_cast<size_t>(to)].state = living_->blocks[static_cast<size_t>(from)].state;
+        }
+        if (const auto name = config_.hunting_names.find(asset.interaction_def); name != config_.hunting_names.end()) {
+            if (const int ni = t.find("UNPCInfo"); ni > 0) {
+                ParsedBlock& info = t.blocks[static_cast<size_t>(ni)];
+                if (info.schema) info.state.state.set(*info.schema, "CharacterName", repl::Value::str(name->second));
+            }
+        }
+        ParsedBlock block = *hunt_block_;
+        const bool ok = block.schema && block.state.state.set(*block.schema, "ComponentDefId.Guid", repl::Value::i64(asset.interact_component));
+        const repl::Value* data = ok ? block.state.state.get(*block.schema, "InteractionInputData") : nullptr;
+        const auto* arr = data ? data->get_if<repl::ArrayValue>() : nullptr;
+        if (!arr || arr->elements.empty()) return plain;   // (the captured block is not what it was read as: the creature stays plain)
+        repl::ArrayValue copy = *arr;
+        copy.elements[0].values[6] = repl::Value::i64(asset.interaction_def);   // InteractionInputData.PlayerInteractDefinition.Guid
+        if (!block.state.state.set(*block.schema, "InteractionInputData", repl::Value(std::move(copy)))) return plain;
+        t.blocks.push_back(std::move(block));
+        ++hunting_made_;
+        return &made_.emplace(key, std::move(t)).first->second;
+    }
+    return plain;
+}
+
+const OpenTemplate* GenericNpcs::station_template(const content::NpcAssetRow& asset, Verdict* why) const {
+    const auto fail = [&](Verdict v) -> const OpenTemplate* {
+        if (why) *why = v;
+        return nullptr;
+    };
+    if (why) *why = Verdict::Generic;
+    const std::string& path = asset.archetype_path;
+    if (!is_station_path(path)) return fail(Verdict::NotPawn);
+    if (const auto it = made_.find(path); it != made_.end()) return &it->second;
+    // the donor: a captured Apprentice station of the same family (processing or fast-craft), the first in the tables' order
+    const bool processing = blueprint_leaf(path).rfind("ProcessingStation_", 0) == 0;
+    const OpenTemplate* donor = nullptr;
+    for (const OpenTemplate& t : captured_->opens()) {
+        if (t.category != "station" || t.blocks.size() != 4) continue;
+        const std::string leaf = blueprint_leaf(t.archetype_path);
+        if ((leaf.rfind("ProcessingStation_", 0) == 0) != processing) continue;
+        if (leaf.size() < 3 || leaf.compare(leaf.size() - 3, 3, "_T2") != 0) continue;
+        donor = &t;
+        break;
+    }
+    if (!donor) return fail(Verdict::NoDonor);
+    OpenTemplate t = *donor;
+    t.archetype_path = path;
+    t.capture = t.channel = t.packet = 0;   // made here: no capture opened it
+    const size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return fail(Verdict::NoPath);
+    const std::string package = path.substr(0, dot), object = path.substr(dot + 1);
+    const auto taken = [&](uint64_t id) { return captured_->static_id_in_use(id) || minted_.count(id) != 0; };
+    repl::ExportLink obj, pkg;
+    obj.guid = FIntrepidNetworkGUID::from_u64(static_object_id(path, taken));
+    minted_.insert(obj.guid.ObjectId);
+    obj.name = object;
+    obj.has_checksum = true;
+    obj.checksum = config_.export_checksum;
+    pkg.guid = FIntrepidNetworkGUID::from_u64(static_object_id(package + "#package", taken));
+    minted_.insert(pkg.guid.ObjectId);
+    pkg.name = package;
+    pkg.has_checksum = true;
+    pkg.checksum = 0;
+    t.archetype = {obj, pkg};
+    ++stations_made_;
+    return &made_.emplace(path, std::move(t)).first->second;
+}
+
+const OpenTemplate* GenericNpcs::make_plain(const content::NpcAssetRow& asset, Verdict* why) const {
+    const auto fail = [&](Verdict v) -> const OpenTemplate* {
+        if (why) *why = v;
+        return nullptr;
+    };
+    const std::string& path = asset.archetype_path;
+    const auto row = blueprints_->find(path);
+    if (!row) return fail(Verdict::NotPawn);
+    if (!donor_) return fail(Verdict::NoDonor);
+// [CoA ~ C:Y:B]
+
+    OpenTemplate t = *donor_;
+    t.archetype_path = path;
+    t.capture = t.channel = t.packet = 0;   // made here: no capture opened it
+    // the archetype's export: the class default object in its package, checksum 0 (see the header), static NetGUIDs of worldd's own
+    const size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return fail(Verdict::NoPath);
+    const std::string package = path.substr(0, dot), object = path.substr(dot + 1);
+    const auto taken = [&](uint64_t id) { return captured_->static_id_in_use(id) || minted_.count(id) != 0; };
+    repl::ExportLink obj, pkg;
+    obj.guid = FIntrepidNetworkGUID::from_u64(static_object_id(path, taken));
+    minted_.insert(obj.guid.ObjectId);
+    obj.name = object;
+    obj.has_checksum = true;
+    obj.checksum = config_.export_checksum;
+    pkg.guid = FIntrepidNetworkGUID::from_u64(static_object_id(package + "#package", taken));
+    minted_.insert(pkg.guid.ObjectId);
+    pkg.name = package;
+    pkg.has_checksum = true;
+    pkg.checksum = 0;
+    t.archetype = {obj, pkg};
+    // the Blueprint's scale (an NPC carries it in SerializeNewActor; 1 is the absence of one)
+    t.spawn.scale.reset();
+    if (row->default_scale != 1.0) {
+        const int64_t bits = static_cast<int64_t>(std::bit_cast<uint64_t>(row->default_scale));
+        t.spawn.scale = repl::QuantVec{repl::QuantVec::Mode::RawDouble, bits, bits, bits};
+    }
+    // the alignments: the Blueprint's StartingAlignments, then the creature's own (the instigator record with its CharacterGuid), as retail lists them
+    for (ParsedBlock& b : t.blocks) {
+        if (b.cls != "UAlignmentComponent" || !b.schema || row->alignments.empty()) continue;
+        const repl::Value* v = b.state.state.get(*b.schema, "Alignments");
+        const auto* c = v ? v->get_if<repl::AlignmentContainer>() : nullptr;
+        if (!c) continue;
+        repl::AlignmentContainer made;
+        for (const int64_t a : row->alignments) {
+            repl::AlignmentContainer::Instance inst;
+            inst.key = static_cast<uint64_t>(a);
+            inst.guids.push_back(repl::GuidValue{});
+            made.instances.push_back(std::move(inst));
+        }
+        for (const auto& inst : c->instances) {
+            const bool own = std::any_of(inst.guids.begin(), inst.guids.end(), [](const repl::GuidValue& g) { return (g.a | g.b | g.c | g.d) != 0; });
+            if (own) made.instances.push_back(inst);   // the donor's instigator record: instantiate gives it the new CharacterGuid
+        }
+        made.timers = c->timers;
+        b.state.state.set(*b.schema, "Alignments", repl::Value(std::move(made)));
+    }
+    return &made_.emplace(path, std::move(t)).first->second;
+}
+
+}  // namespace aoc::worldd::spawns
