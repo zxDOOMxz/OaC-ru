@@ -22,6 +22,8 @@
 
 ## Дорожная карта
 
+> Пошаговая инструкция для домашнего ПК: [`docs/HOME_SETUP.md`](HOME_SETUP.md)
+
 1. **Дома**: установить зависимости (`install_dependencies.bat`).
 2. **Дома**: собрать всё (`build_all.bat`) — извлечёт данные из клиента
    и соберёт сервер. Navmesh (`dist\content\area_nav.bin`, ~1.2 ГБ)
